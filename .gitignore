@@ -1,0 +1,32 @@
+# R session files
+.Rhistory
+.RData
+.RDataTmp
+.Ruserdata
+.Rprofile
+
+# macOS
+.DS_Store
+
+# renv (keep lockfile, ignore local library)
+renv/library/
+renv/staging/
+
+# Data
+data/raw/
+# Processed data (keep repo light)
+data/processed/
+# Local databases / large artifacts
+data/*.sqlite
+data/*.sqlite3
+data/**/*.sqlite
+data/**/*.sqlite3
+
+# Quarto / knitr
+.quarto/
+.knitr_cache/
+*_files/
+*.html
+
+# RStudio
+.Rproj.user/

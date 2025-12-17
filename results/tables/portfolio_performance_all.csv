@@ -1,0 +1,6 @@
+"Strategy","Ann_Mean","Ann_SD","Sharpe"
+"Market",0.114,0.1546,0.7379
+"Multi-factor (fixed)",0.0902,0.0455,1.9853
+"Equal-weight",0.0439,0.0401,1.0956
+"Risk-parity (1/vol)",0.0397,0.0374,1.0611
+"Mean-variance",0.0432,0.0363,1.1906

@@ -1,0 +1,690 @@
+---
+title: "Replicating Fama–French Factors from CRSP–Compustat (FF5 + Momentum)"
+format: html
+execute:
+  warning: false
+  message: false
+---
+
+## Purpose
+This notebook replicates the core Fama–French equity factor returns using CRSP–Compustat data and standard portfolio construction rules, and evaluates the quality of replication against the official factor series. Specifically, we reconstruct SMB, HML, RMW, and CMA using NYSE breakpoints and value-weighted portfolios, and independently implement the canonical 12–2 momentum factor from CRSP data.
+
+Replication accuracy is assessed via time-series regressions of official factors on their replicated counterparts, with Newey–West standard errors used to account for autocorrelation and heteroskedasticity.
+
+An extension explores alternative momentum specifications as robustness checks.
+
+## Inputs
+- **Data source:** SQLite database (`TIDY_FINANCE_DB` environment variable; fallback: `data/tidy_finance_r.sqlite`)
+- **Required tables:**
+  - `crsp_monthly` — monthly stock returns, market equity, exchange codes, and lagged market cap weights
+  - `compustat` — firm fundamentals used for sorting (book equity `be`, profitability `op`, investment `inv`)
+  - `factors_ff5_monthly` — official FF5 factor series (for validation/comparison)
+  - `factors_mom_monthly` — official momentum factor series (for validation/comparison)
+  - *(optional)* `factors_ff3_monthly` — used for additional checks/benchmarking
+
+## Outputs
+- **Processed data**
+  - `data/processed/ff_factors_replicated.rds`  
+    Replicated Fama–French factor returns (SMB, HML, RMW, CMA).
+  - `data/processed/ff_replication_panel.rds`  
+    Panel combining official and replicated factors used for replication regressions.
+    
+- **Tables**
+  - `results/tables/factor_replication_nw.csv`  
+    Replication regressions of official Fama–French factors on replicated factors using Newey–West standard errors.
+  - `results/tables/momentum_robustness_summary.csv`  
+    Summary statistics (mean, volatility, Sharpe) for baseline and alternative momentum specifications.
+    
+- **Figures**
+  - `results/figures/momentum_12_2_timeseries.png`  
+    Time-series plot of the replicated 12–2 momentum factor.
+
+```{r setup}
+source(here::here("R", "config.R"))
+source(here::here("R", "utils.R"))
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(DBI)
+library(RSQLite)
+library(lubridate)
+library(slider)
+library(sandwich)
+library(lmtest)
+library(broom)
+
+assert_db_exists()
+con <- connect_db(DB_PATH)
+```
+
+```{r load-data}
+crsp_monthly <- load_or_build(
+  file.path(DIR_DATA_PROCESSED, "crsp_monthly.rds"),
+  function() {
+    tbl(con, "crsp_monthly") %>%
+      select(permno, gvkey, date, ret_excess, mktcap, mktcap_lag, exchange) %>%
+      collect() %>%
+      mutate(date = ff_date_from_int(date))
+  }
+)
+
+compustat <- load_or_build(
+  file.path(DIR_DATA_PROCESSED, "compustat_selected.rds"),
+  function() {
+    tbl(con, "compustat") %>%
+      select(gvkey, datadate, be, op, inv) %>%
+      collect() %>%
+      mutate(datadate = ff_date_from_int(datadate))
+  }
+)
+
+ff5_official <- load_or_build(
+  file.path(DIR_DATA_PROCESSED, "ff5_official.rds"),
+  function() {
+    tbl(con, "factors_ff5_monthly") %>%
+      collect() %>%
+      mutate(date = ff_date_from_int(date))
+  }
+)
+
+mom_official <- load_or_build(
+  file.path(DIR_DATA_PROCESSED, "mom_official.rds"),
+  function() {
+    tbl(con, "factors_mom_monthly") %>%
+      collect() %>%
+      mutate(date = ff_date_from_int(date))
+  }
+)
+
+DBI::dbDisconnect(con)
+```
+
+## Replicating FF5 Factors
+```{r sorting}
+# Construct July sorting_date aligned with Fama–French convention:
+# - Size is measured at end of June (used for July sorting)
+# - Market equity for BM uses December market cap (lagged to next July)
+# - Compustat fundamentals dated at fiscal year-end, aligned to next July
+
+size <- crsp_monthly %>%
+  filter(lubridate::month(date) == 6) %>%                      # June market cap
+  mutate(sorting_date = lubridate::ymd(paste0(lubridate::year(date), "-07-01"))) %>%
+  select(permno, exchange, sorting_date, size = mktcap)
+
+market_equity <- crsp_monthly %>%
+  filter(lubridate::month(date) == 12) %>%                     # Dec market cap
+  mutate(sorting_date = lubridate::ymd(paste0(lubridate::year(date) + 1, "-07-01"))) %>%
+  select(permno, gvkey, sorting_date, me = mktcap)
+
+book_to_market <- compustat %>%
+  mutate(sorting_date = lubridate::ymd(stringr::str_c(lubridate::year(datadate) + 1, "0701"))) %>%
+  select(gvkey, sorting_date, be) %>%
+  inner_join(market_equity, by = c("gvkey", "sorting_date")) %>%
+  mutate(bm = be / me) %>%
+  select(permno, sorting_date, me, bm)
+
+sorting_variables <- size %>%
+  inner_join(book_to_market, by = c("permno", "sorting_date")) %>%
+  tidyr::drop_na() %>%
+  distinct(permno, sorting_date, .keep_all = TRUE)
+```
+
+```{r assign-portfolio}
+# Assign stocks to FF-style characteristic portfolios using NYSE breakpoints:
+# - Size: median split (Small/Big) at each July sorting_date
+# - Book-to-market: 30/70 split (Low/Neutral/High) at each July sorting_date
+
+portfolios <- sorting_variables %>%
+  group_by(sorting_date) %>%
+  mutate(
+    portfolio_size = assign_portfolio(
+      data = pick(everything()),
+      sorting_variable = size,
+      percentiles = 0.5
+    ),
+    portfolio_bm = assign_portfolio(
+      data = pick(everything()),
+      sorting_variable = bm,
+      percentiles = c(0.3, 0.7)
+    )
+  ) %>%
+  ungroup() %>%
+  select(permno, sorting_date, portfolio_size, portfolio_bm)
+```
+
+```{r}
+# Attach portfolio labels to each monthly return by mapping each month to its
+# July sorting_date (FF convention: portfolios formed in July are held through June).
+
+portfolios_panel <- crsp_monthly %>%
+  mutate(
+    sorting_date = lubridate::ymd(stringr::str_c(
+      if_else(lubridate::month(date) <= 6, lubridate::year(date) - 1, lubridate::year(date)),
+      "0701"
+    ))
+  ) %>%
+  inner_join(portfolios, by = c("permno", "sorting_date"))
+
+# How many rows got portfolio labels
+mean(!is.na(portfolios_panel$portfolio_size))
+```
+
+I first explored constructing FF-style size portfolios and then extend the sorting to book-to-market, profitability, and investment characteristics to replicate the full FF5 factor set.
+
+```{r additional-sorting}
+# Build additional sorting variables (BM, OP, INV) aligned to July sorting_date
+# Use Compustat fundamentals (BE/OP/INV) and December market equity (ME),
+# then compute BM = BE / ME for characteristic sorts.
+
+other_sorting_variables <- compustat %>%
+  mutate(
+    sorting_date = lubridate::ymd(stringr::str_c(lubridate::year(datadate) + 1, "0701"))
+  ) %>%
+  select(gvkey, sorting_date, be, op, inv) %>%
+  inner_join(market_equity, by = c("gvkey", "sorting_date")) %>%
+  mutate(bm = be / me) %>%
+  select(permno, sorting_date, me, be, bm, op, inv)
+
+sorting_variables_full <- size %>%
+  inner_join(other_sorting_variables, by = c("permno", "sorting_date")) %>%
+  tidyr::drop_na() %>%
+  distinct(permno, sorting_date, .keep_all = TRUE)
+```
+
+```{r assign-portfolios}
+# Assign FF-style portfolios at each July sorting_date:
+# 1) Size: NYSE median split (Small/Big)
+# 2) Within each size bucket: BM/OP/INV split at NYSE 30/70 (Low/Neutral/High)
+
+portfolio_assignments <- sorting_variables_full %>%
+  group_by(sorting_date) %>%
+  mutate(
+    portfolio_size = assign_portfolio(pick(everything()), size, percentiles = 0.5)
+  ) %>%
+  group_by(sorting_date, portfolio_size) %>%
+  mutate(
+    portfolio_bm  = assign_portfolio(pick(everything()), bm,  percentiles = c(0.3, 0.7)),
+    portfolio_op  = assign_portfolio(pick(everything()), op,  percentiles = c(0.3, 0.7)),
+    portfolio_inv = assign_portfolio(pick(everything()), inv, percentiles = c(0.3, 0.7))
+  ) %>%
+  ungroup() %>%
+  select(permno, sorting_date, portfolio_size, portfolio_bm, portfolio_op, portfolio_inv)
+```
+
+```{r build-portfolios-panel}
+# Map each month to the latest July formation date and attach portfolio labels.
+# Output: portfolios_panel (monthly stock returns + portfolio assignments)
+
+portfolios_panel <- crsp_monthly %>%
+  mutate(
+    sorting_date = dplyr::case_when(
+      lubridate::month(date) <= 6 ~ lubridate::ymd(paste0(lubridate::year(date) - 1, "-07-01")),
+      TRUE                        ~ lubridate::ymd(paste0(lubridate::year(date),     "-07-01"))
+    )
+  ) %>%
+  inner_join(
+    portfolio_assignments %>%
+      distinct(permno, sorting_date, portfolio_size, portfolio_bm, portfolio_op, portfolio_inv),
+    by = c("permno", "sorting_date")
+  )
+
+portfolios_panel %>%
+  arrange(date) %>%
+  summarise(
+    min_gap_days = min(as.numeric(date - dplyr::lag(date)), na.rm = TRUE),
+    max_gap_days = max(as.numeric(date - dplyr::lag(date)), na.rm = TRUE)
+  )
+```
+
+```{r hml-replication}
+# HML replication:
+# 1) Compute value-weighted excess returns for each (Size × BM) portfolio each month
+# 2) HML = average(High BM portfolios) − average(Low BM portfolios)
+
+portfolios_value <- portfolios_panel %>%
+  group_by(portfolio_size, portfolio_bm, date) %>%
+  summarise(
+    ret = weighted.mean(ret_excess, w = mktcap_lag, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+hml_replicated <- portfolios_value %>%
+  group_by(date) %>%
+  summarise(
+    hml_replicated = mean(ret[portfolio_bm == 3], na.rm = TRUE) -
+                     mean(ret[portfolio_bm == 1], na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r rmw-replication}
+# RMW replication:
+# 1) Compute value-weighted excess returns for each (Size × OP) portfolio each month
+# 2) RMW = average(Robust profitability) − average(Weak profitability)
+
+portfolios_profitability <- portfolios_panel %>%
+  group_by(portfolio_size, portfolio_op, date) %>%
+  summarise(
+    ret = weighted.mean(ret_excess, w = mktcap_lag, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+rmw_replicated <- portfolios_profitability %>%
+  group_by(date) %>%
+  summarise(
+    rmw_replicated = mean(ret[portfolio_op == 3], na.rm = TRUE) -
+                     mean(ret[portfolio_op == 1], na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r cma-replication}
+# CMA replication:
+# 1) Compute value-weighted excess returns for each (Size × INV) portfolio each month
+# 2) CMA = average(Conservative investment) − average(Aggressive investment)
+
+portfolios_investment <- portfolios_panel %>%
+  group_by(portfolio_size, portfolio_inv, date) %>%
+  summarise(
+    ret = weighted.mean(ret_excess, w = mktcap_lag, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cma_replicated <- portfolios_investment %>%
+  group_by(date) %>%
+  summarise(
+    cma_replicated = mean(ret[portfolio_inv == 1], na.rm = TRUE) -
+                     mean(ret[portfolio_inv == 3], na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r smb-replication}
+# SMB replication (FF5-style):
+# Compute Small − Big within each 2×3 sort (BM, OP, INV), then average across the three legs.
+
+smb_replicated <- bind_rows(
+  portfolios_value %>% mutate(leg = "BM"),
+  portfolios_profitability %>% mutate(leg = "OP"),
+  portfolios_investment %>% mutate(leg = "INV")
+) %>%
+  group_by(leg, date) %>%
+  summarise(
+    smb_leg = mean(ret[portfolio_size == 1], na.rm = TRUE) -
+              mean(ret[portfolio_size == 2], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(date) %>%
+  summarise(
+    smb_replicated = mean(smb_leg, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r assemble-replicated-factors}
+# Combine replicated factors into a single time series table
+factors_replicated <- smb_replicated %>%
+  full_join(hml_replicated, by = "date") %>%
+  full_join(rmw_replicated, by = "date") %>%
+  full_join(cma_replicated, by = "date") %>%
+  arrange(date)
+
+# Join official FF factors with replicated factors for validation/regression
+ff_replication_panel <- ff5_official %>%
+  select(date, smb, hml, rmw, cma) %>%
+  inner_join(factors_replicated, by = "date")
+```
+
+```{r save-replicated-factors}
+saveRDS(
+  factors_replicated,
+  file.path(DIR_DATA_PROCESSED, "ff_factors_replicated.rds")
+)
+
+saveRDS(
+  ff_replication_panel,
+  file.path(DIR_DATA_PROCESSED, "ff_replication_panel.rds")
+)
+```
+
+## Independent Replication of Momentum Factor
+```{r mom-replication}
+# Momentum (12–2) replication:
+# - Signal: cumulative excess return from months t-12 to t-2 (skip month t-1)
+# - Sort: 30/70 breakpoints each month (Winner vs Loser)
+# - Factor: value-weighted Winner − Loser
+
+# 0) Build per-stock momentum signal (12–2) WITHOUT look-ahead
+crsp_mom <- crsp_monthly %>%
+  arrange(permno, date) %>%
+  group_by(permno) %>%
+  mutate(
+    one_plus = 1 + ret_excess,
+
+    # Use lagged returns so the signal for month t only uses info available
+    # up to month t-1 (formation happens at end of t-1).
+    one_plus_lag1 = dplyr::lag(one_plus, 1),
+
+    # product over months (t-12 ... t-1)
+    prod_12_1 = slider::slide_dbl(one_plus_lag1, ~ prod(.x), .before = 11, .complete = TRUE),
+
+    # skip month (t-1) -> product over (t-12 ... t-2)
+    mom_signal = prod_12_1 / one_plus_lag1 - 1
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(mom_signal), !is.na(mktcap_lag))
+
+# 1) Cross-sectional breakpoints (30/70) each month
+mom_breaks <- crsp_mom %>%
+  group_by(date) %>%
+  summarise(
+    p30 = quantile(mom_signal, 0.3, na.rm = TRUE),
+    p70 = quantile(mom_signal, 0.7, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 2) Winner/Loser assignment
+crsp_mom_labeled <- crsp_mom %>%
+  inner_join(mom_breaks, by = "date") %>%
+  mutate(
+    mom_group = case_when(
+      mom_signal <= p30 ~ "Loser",
+      mom_signal >= p70 ~ "Winner",
+      TRUE              ~ "Middle"
+    )
+  )
+
+# 3) Value-weighted W/L returns and MOM factor (excess)
+mom_own <- crsp_mom_labeled %>%
+  filter(mom_group %in% c("Loser", "Winner")) %>%
+  group_by(date, mom_group) %>%
+  summarise(
+    port_ret = weighted.mean(ret_excess, w = mktcap_lag, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(names_from = mom_group, values_from = port_ret) %>%
+  mutate(MOM_own = Winner - Loser) %>%
+  select(date, MOM_own)
+```
+
+We use cross-sectional 30/70 breakpoints (no NYSE filter) as a close approximation; results are validated against the official series.
+
+```{r compare-mom}
+# Compare to official MOM + replication regression
+
+mom_test <- mom_own %>%
+  inner_join(mom_official %>% transmute(date, MOM_ff = mom), by = "date")
+
+# Summary stats for the replicated MOM
+mom_own_stats <- mom_test %>%
+  summarise(
+    Mean   = mean(MOM_own, na.rm = TRUE),
+    SD     = sd(MOM_own, na.rm = TRUE),
+    Sharpe = (Mean / SD) * sqrt(12)
+  )
+
+mom_own_stats
+
+# Replication regression: MOM_ff on MOM_own
+summary(lm(MOM_ff ~ MOM_own, data = mom_test))
+```
+
+```{r factor-plots-and-stats, fig.height=4, fig.width=9}
+# Replicated factor plots + summary table (clean, readable)
+# - Plots: monthly series (light) + 12-month rolling mean (bold) + zero line
+# - Table: mean / sd / annualized Sharpe for each replicated factor
+
+factor_cols <- setdiff(names(factors_replicated), "date")
+
+# Summary table
+factor_summary <- factors_replicated %>%
+  tidyr::pivot_longer(all_of(factor_cols), names_to = "Factor", values_to = "Return") %>%
+  group_by(Factor) %>%
+  summarise(
+    Mean_monthly = mean(Return, na.rm = TRUE),
+    SD_monthly   = sd(Return,   na.rm = TRUE),
+    Sharpe_ann   = ann_sharpe(Return),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+knitr::kable(factor_summary, caption = "Replicated factor summary statistics")
+
+# Plots (one per factor)
+for (fac in factor_cols) {
+
+  plot_df <- factors_replicated %>%
+    select(date, value = all_of(fac)) %>%
+    arrange(date) %>%
+    mutate(
+      roll12 = slider::slide_dbl(value, mean, .before = 11, .complete = TRUE, na.rm = TRUE)
+    )
+  
+  print(
+    ggplot(plot_df, aes(x = date)) +
+      geom_hline(yintercept = 0, linewidth = 0.4, linetype = "dashed", alpha = 0.6) +
+      geom_line(aes(y = value), linewidth = 0.35, alpha = 0.35, na.rm = TRUE) +
+      geom_line(
+        data = dplyr::filter(plot_df, !is.na(roll12)),
+        aes(y = roll12),
+        linewidth = 0.9
+      ) +
+      scale_x_date(date_breaks = "10 years", date_labels = "%Y") +
+      labs(
+        title = paste0("Replicated Factor: ", fac),
+        subtitle = "Monthly returns (light) with 12-month rolling mean (bold)",
+        x = NULL,
+        y = "Monthly return"
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(
+        plot.title.position = "plot",
+        panel.grid.minor = element_blank()
+      )
+  )
+}
+```
+
+```{r mom-stats-plot, fig.width=9, fig.height=4}
+# Replicated MOM (12–2): stats + cleaner visualization
+# - Show monthly series (light) + 12-month rolling mean (bold)
+# - Add 0 line and decade ticks for readability
+
+mom_own_stats <- mom_own %>%
+  summarise(
+    Mean_monthly = mean(MOM_own, na.rm = TRUE),
+    SD_monthly   = sd(MOM_own,   na.rm = TRUE),
+    Sharpe_ann   = ann_sharpe(MOM_own)
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+knitr::kable(mom_own_stats, caption = "Replicated MOM (12–2) summary statistics")
+
+mom_plot_df <- mom_own %>%
+  arrange(date) %>%
+  mutate(
+    roll12 = slider::slide_dbl(MOM_own, mean, .before = 11, .complete = TRUE, na.rm = TRUE)
+  )
+
+ggplot(mom_plot_df, aes(x = date)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, linetype = "dashed", alpha = 0.6) +
+  geom_line(aes(y = MOM_own), linewidth = 0.35, alpha = 0.35) +
+  geom_line(
+    data = dplyr::filter(mom_plot_df, !is.na(roll12)),
+    aes(y = roll12),
+    linewidth = 0.9
+  ) +
+  scale_x_date(date_breaks = "10 years", date_labels = "%Y") +
+  labs(
+    title = "Replicated Momentum Factor (MOM, 12–2)",
+    subtitle = "Monthly returns (light) with 12-month rolling mean (bold)",
+    x = NULL,
+    y = "Monthly return"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title.position = "plot",
+    panel.grid.minor = element_blank()
+  )
+```
+
+## Non standard error analysis
+
+```{r build-test-dataset}
+stopifnot(exists("factors_replicated"), exists("ff5_official"))
+
+test <- ff5_official %>%
+  inner_join(factors_replicated, by = "date")
+
+glimpse(test)
+```
+
+```{r}
+# Validate replication quality by regressing each official factor on its replicated series:
+#   official_t = alpha + beta * replicated_t + eps_t
+# and reporting Newey–West (lag = 6) robust inference for beta.
+
+spec <- tibble(
+  Factor = c("SMB", "HML", "RMW", "CMA"),
+  official = c("smb", "hml", "rmw", "cma"),
+  repl     = c("smb_replicated", "hml_replicated", "rmw_replicated", "cma_replicated")
+)
+
+results_nw <- purrr::pmap_dfr(
+  spec,
+  \(Factor, official, repl) replication_row(
+    data = test,
+    official = official,
+    replicated = repl,
+    name = Factor,
+    lag = 6
+  )
+) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+knitr::kable(
+  results_nw,
+  caption = "Replication regressions (official ~ replicated) with Newey–West SEs (lag = 6)"
+)
+```
+
+The replication quality is very strong across all four factors. Estimated betas are close to one (0.94–0.96), indicating that the replicated factors closely track the official Fama–French series. Intercepts are economically negligible and statistically insignificant, suggesting no systematic bias in the replication. Newey–West t-statistics are extremely large, confirming statistical significance after accounting for autocorrelation. High R² values (0.91–0.98) show that most of the variation in the official factors is explained by the replicated versions, validating the accuracy of the replication methodology.
+
+## Robustness: Alternative Momentum Specifications
+
+I want to expand our project and explore whether the momentum premium persist under reasonable alternative definitions.
+
+```{r mom-robustness, message=FALSE, warning=FALSE}
+# -------------------------------------------------------------------
+# Robustness: Alternative Momentum Specifications
+#
+# Purpose:
+#   Assess the sensitivity of the momentum premium to alternative
+#   constructions beyond the baseline 12–2 definition.
+#
+# Implemented variants:
+#   1) MOM_own_6_1: shorter-horizon momentum (months t-6 to t-2)
+#   2) MOM_own_vol_scaled: volatility-scaled version of baseline MOM
+#
+# Evaluation:
+#   Compare mean returns, volatility, and annualized Sharpe ratios
+#   to assess robustness of the momentum effect.
+#
+# Notes:
+#   - Uses the same cross-sectional sorting and value-weighting scheme
+#     as the baseline momentum replication.
+#   - This section is intended as a robustness check, not a new factor claim.
+# -------------------------------------------------------------------
+
+# --- A) Alternative MOM signal: 6–1 (months t-6 ... t-2) ---
+crsp_mom_6_1 <- crsp_monthly %>%
+  arrange(permno, date) %>%
+  group_by(permno) %>%
+  mutate(
+    one_plus = 1 + ret_excess,
+    # product over last 6 months (t-5...t) then divide out current and lag1 to skip t and t-1
+    prod_6_0 = slide_dbl(one_plus, ~ prod(.x), .before = 5, .complete = TRUE),
+    mom_6_1  = prod_6_0 / one_plus / lag(one_plus, 1) - 1
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(mom_6_1), !is.na(mktcap_lag))
+
+mom_breaks_6_1 <- crsp_mom_6_1 %>%
+  group_by(date) %>%
+  summarise(
+    p30 = quantile(mom_6_1, 0.3, na.rm = TRUE),
+    p70 = quantile(mom_6_1, 0.7, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+mom_own_6_1 <- crsp_mom_6_1 %>%
+  inner_join(mom_breaks_6_1, by = "date") %>%
+  mutate(
+    mom_group = case_when(
+      mom_6_1 <= p30 ~ "Loser",
+      mom_6_1 >= p70 ~ "Winner",
+      TRUE           ~ "Middle"
+    )
+  ) %>%
+  filter(mom_group %in% c("Loser", "Winner")) %>%
+  group_by(date, mom_group) %>%
+  summarise(port_ret = weighted.mean(ret_excess, w = mktcap_lag, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = mom_group, values_from = port_ret) %>%
+  transmute(date, MOM_own_6_1 = Winner - Loser)
+
+# --- B) Volatility-scaled MOM (scale baseline MOM_own by rolling 12m vol) ---
+mom_scaled <- mom_own %>%
+  arrange(date) %>%
+  mutate(
+    vol12 = slide_dbl(MOM_own, sd, .before = 11, .complete = TRUE, na.rm = TRUE),
+    MOM_own_vol_scaled = MOM_own / vol12
+  )
+
+# --- Summary table (annualized Sharpe uses ann_sharpe from utils.R) ---
+mom_robust_tbl <- tibble(
+  Series = c("MOM_own (12–2)", "MOM_own_6_1 (6–1)", "MOM_own_vol_scaled"),
+  Return = list(
+    mom_own$MOM_own,
+    mom_own_6_1$MOM_own_6_1,
+    mom_scaled$MOM_own_vol_scaled
+  )
+) %>%
+  mutate(
+    Mean_monthly = sapply(Return, function(x) mean(x, na.rm = TRUE)),
+    SD_monthly   = sapply(Return, function(x) sd(x, na.rm = TRUE)),
+    Sharpe_ann   = sapply(Return, ann_sharpe)
+  ) %>%
+  select(-Return) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+knitr::kable(mom_robust_tbl, caption = "Robustness: alternative momentum specifications")
+```
+
+To assess whether the momentum results are sensitive to the exact factor construction, I explore two alternative momentum specifications in addition to the baseline 12–2 definition. First, I implement a shorter-horizon 6–1 momentum strategy, which uses a reduced lookback window while maintaining the standard one-month skip. Second, I construct a volatility-scaled version of the baseline momentum factor by normalizing returns with a rolling volatility estimate.
+
+The results indicate that the momentum premium is robust to reasonable alternative definitions. While the shorter-horizon 6–1 momentum exhibits weaker performance—consistent with increased noise and reduced signal persistence at shorter horizons—the volatility-scaled momentum variant achieves substantially higher risk-adjusted returns. This suggests that scaling momentum exposure by recent volatility can meaningfully improve Sharpe ratios without altering the underlying signal.
+
+Overall, these robustness checks confirm that the core momentum effect persists across specifications and that risk normalization plays an important role in enhancing the performance of momentum-based strategies.
+
+```{r}
+write.csv(
+  mom_robust_tbl,
+  file.path(DIR_RESULTS_TABLES, "momentum_robustness_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  results_nw,
+  file.path(DIR_RESULTS_TABLES, "factor_replication_nw.csv"),
+  row.names = FALSE
+)
+
+ggsave(
+  file.path(DIR_RESULTS_FIGS, "momentum_12_2_timeseries.png"),
+  plot = last_plot(),
+  width = 9,
+  height = 4,
+  dpi = 300
+)
+```

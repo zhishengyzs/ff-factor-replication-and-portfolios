@@ -1,0 +1,440 @@
+---
+title: "Factor Based Portfolios"
+format: html
+---
+
+## Purpose
+Explore standard U.S. equity factor returns (MKT, SMB, HML, RMW, CMA, MOM) and compare factor-based portfolio construction rules.
+
+## Inputs
+- **Data source:** SQLite database (`TIDY_FINANCE_DB` environment variable, fallback: `data/tidy_finance_r.sqlite`)
+- **Required tables:**
+  - `factors_ff5_monthly` — Fama–French 5 factors (monthly, excess returns + RF)
+  - `factors_mom_monthly` — Momentum factor (monthly)
+  
+## Outputs
+- **Processed data (saved to `data/processed/`):**
+  - Cumulative return time series for all portfolio strategies:  
+    `cumulative_returns_all_strategies.rds`
+
+- **Tables (saved to `results/tables/`):**
+  - Portfolio performance summary statistics:  
+    `portfolio_performance_summary.csv`
+  - Full portfolio performance metrics for all strategies:  
+    `portfolio_performance_all.csv`
+  - Multi-factor return contribution decomposition:  
+    `multifactor_contributions.csv`
+
+- **Figures (saved to `results/figures/`):**
+  - Time-series of replicated FF5 factor returns:  
+    `ff5_factor_returns_timeseries.png`
+  - Cumulative returns: market vs multi-factor portfolio:  
+    `cum_reutrn_market_vs_multifactor.png`
+  - Cumulative returns for all portfolio strategies:  
+    `cumulative_returns_all_strategies.png`
+
+```{r setup}
+source(here::here("R", "config.R"))
+source(here::here("R", "utils.R"))
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+
+assert_db_exists()
+con <- connect_db(DB_PATH)
+```
+
+```{r load-data}
+# Load factor data (cached)
+ff5_path <- file.path(DIR_DATA_PROCESSED, "ff5_monthly.rds")
+mom_path <- file.path(DIR_DATA_PROCESSED, "mom_monthly.rds")
+
+ff5 <- load_or_build(ff5_path, function() {
+  tbl(con, "factors_ff5_monthly") %>%
+    collect() %>%
+    mutate(date = ff_date_from_int(date))
+})
+
+mom <- load_or_build(mom_path, function() {
+  tbl(con, "factors_mom_monthly") %>%
+    collect() %>%
+    mutate(date = ff_date_from_int(date))
+})
+
+DBI::dbDisconnect(con)
+```
+
+```{r}
+# FF5 factor time-series plot
+# Quick sanity check (date alignment + missingness) and visual
+# regime scan before portfolio construction.
+# Individual factor quick look follows
+
+stopifnot(inherits(ff5$date, "Date"))
+
+p_ff5 <- ff5 %>%
+  select(date, mkt_excess, smb, hml, rmw, cma) %>%
+  pivot_longer(-date, names_to = "factor", values_to = "ret") %>%
+  ggplot(aes(date, ret, color = factor)) +
+  geom_hline(yintercept = 0, linewidth = 0.25, alpha = 0.6) +
+  geom_line(linewidth = 0.5) +
+  labs(
+    title = "Fama–French 5 Factors (Monthly Returns)",
+    x = "Date",
+    y = "Monthly return",
+    color = "Factor"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_ff5
+```
+
+## Market Factor
+```{r}
+ggplot(ff5, aes(x = date, y = mkt_excess)) +
+  geom_line(color = "#0072B2") +
+  labs(title = "Market Excess Return over Time",
+       y = "Excess Return (Monthly)",
+       x = "Date Index") +
+  theme_minimal(base_size = 12)
+```
+
+## Size Factor
+```{r}
+ggplot(ff5, aes(x = date, y = smb)) +
+  geom_line(color = "#D55E00") +
+  labs(title = "Size Factor (SMB): Small Minus Big",
+       y = "Monthly Return",
+       x = "Date Index") +
+  theme_minimal()
+```
+
+## Value Factor
+```{r}
+ggplot(ff5, aes(x = date, y = hml)) +
+  geom_line(color = "#009E73") +
+  labs(title = "Value Factor (HML): High Minus Low",
+       y = "Monthly Return",
+       x = "Date Index") +
+  theme_minimal()
+```
+
+## Profitability Factor
+```{r}
+ggplot(ff5, aes(x = date, y = rmw)) +
+  geom_line(color = "#F0E442") +
+  labs(title = "Profitability Factor (RMW): Robust Minus Weak",
+       y = "Monthly Return",
+       x = "Date Index") +
+  theme_minimal()
+```
+
+## Investment Factor
+```{r}
+ggplot(ff5, aes(x = date, y = cma)) +
+  geom_line(color = "#56B4E9") +
+  labs(title = "Investment Factor (CMA): Conservative Minus Aggressive",
+       y = "Monthly Return",
+       x = "Date Index") +
+  theme_minimal()
+```
+
+## Momentum Factor
+```{r}
+ggplot(mom, aes(x = date, y = mom)) +
+  geom_line(color = "#CC79A7") +
+  labs(title = "Momentum Factor (MOM): Winners Minus Losers",
+       y = "Monthly Return",
+       x = "Date Index") +
+  theme_minimal()
+```
+
+```{r}
+factor_summary <- data.frame(
+  Factor = c("MKT", "SMB", "HML", "RMW", "CMA", "MOM"),
+  Mean = c(mean(ff5$mkt_excess), mean(ff5$smb), mean(ff5$hml),
+           mean(ff5$rmw), mean(ff5$cma), mean(mom$mom)),
+  SD = c(sd(ff5$mkt_excess), sd(ff5$smb), sd(ff5$hml),
+         sd(ff5$rmw), sd(ff5$cma), sd(mom$mom))
+)
+factor_summary
+```
+
+```{r}
+library(patchwork)
+
+p1 <- ggplot(ff5, aes(date, mkt_excess)) + geom_line(color="#0072B2") + labs(title="Market")
+p2 <- ggplot(ff5, aes(date, smb)) + geom_line(color="#D55E00") + labs(title="SMB")
+p3 <- ggplot(ff5, aes(date, hml)) + geom_line(color="#009E73") + labs(title="HML")
+p4 <- ggplot(ff5, aes(date, rmw)) + geom_line(color="#F0E442") + labs(title="RMW")
+p5 <- ggplot(ff5, aes(date, cma)) + geom_line(color="#56B4E9") + labs(title="CMA")
+p6 <- ggplot(mom, aes(date, mom)) + geom_line(color="#CC79A7") + labs(title="MOM")
+
+(p1 + p2) / (p3 + p4) / (p5 + p6) + plot_annotation(title = "Monthly Returns of Six Common Factors")
+```
+
+## Constructing a Long-Only Multi-Factor Portfolio
+```{r}
+factors <- ff5 %>%
+  select(date, mkt_excess, smb, hml, rmw, cma, risk_free) %>%
+  inner_join(mom %>% select(date, mom), by = "date") %>%
+  transmute(
+    date,
+    MKT = mkt_excess,
+    SMB = smb,
+    HML = hml,
+    RMW = rmw,
+    CMA = cma,
+    MOM = mom,
+    RF  = risk_free,
+    MKT_total = mkt_excess + risk_free
+  ) %>%
+  arrange(date)
+```
+
+```{r}
+# Define multi-factor portfolio weights guided by the literature
+weights <- c(
+  MKT = 0.25,
+  SMB = 0.15,
+  HML = 0.15,
+  RMW = 0.15,
+  CMA = 0.15,
+  MOM = 0.15
+)
+weights
+```
+
+```{r}
+# Fixed-weight multi-factor portfolio
+# Construct a long-only, fixed-weight multi-factor portfolio using
+# excess factor returns, then convert to total returns by adding RF.
+
+factors <- factors %>%
+  mutate(
+    mf_excess = as.numeric(
+      as.matrix(select(., all_of(names(weights)))) %*% weights
+    ),
+    mf_total = RF + mf_excess
+  )
+```
+
+```{r}
+# Performance comparison: Market vs Fixed-weight Multi-factor portfolio
+# Compare the baseline market portfolio to the strategic multi-factor
+# allocation using annualized mean, volatility, and Sharpe ratio.
+
+perf_tbl <- tibble(
+  Strategy = c("Market", "Multi-factor"),
+  Return   = list(factors$MKT_total, factors$mf_total)
+) %>%
+  mutate(
+    Ann_Mean = map_dbl(Return, ann_mean),
+    Ann_SD   = map_dbl(Return, ann_sd),
+    Sharpe   = map_dbl(Return, ann_sharpe)
+  ) %>%
+  select(-Return) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+knitr::kable(
+  perf_tbl,
+  caption = "Annualized performance: Market vs fixed-weight multi-factor portfolio"
+)
+```
+
+
+```{r}
+cum_df <- factors %>%
+  transmute(
+    date,
+    Market = cumprod(1 + MKT_total),   # growth of $1
+    `Multi-factor` = cumprod(1 + mf_total)
+  ) %>%
+  pivot_longer(-date, names_to = "Strategy", values_to = "Wealth")
+
+p_cum <- ggplot(cum_df, aes(x = date, y = Wealth, color = Strategy)) +
+  geom_line(linewidth = 0.6) +
+  labs(
+    title = "Cumulative Return: Market vs Multi-factor Portfolio",
+    x = "Date",
+    y = "Growth of $1"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_cum
+```
+
+```{r}
+# Factor contribution to fixed-weight multi-factor excess return
+# Decompose expected annual excess return into factor-level contributions.
+
+factor_cols <- names(weights)
+stopifnot(all(factor_cols %in% names(factors)))
+
+contrib_tbl <- tibble(
+  Factor = factor_cols,
+  Weight = as.numeric(weights),
+  Ann_Excess = colMeans(factors[, factor_cols], na.rm = TRUE) * 12
+) %>%
+  mutate(
+    Weighted_Ann_Excess = Weight * Ann_Excess
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+knitr::kable(
+  contrib_tbl,
+  caption = "Factor weights and contributions to annual excess return"
+)
+```
+
+## Optimized / Risk-based Factor Portfolios (Excess Returns)
+```{r}
+# We treat the six factors as investable excess-return building blocks and compare
+# three allocation rules: Equal-weight, Risk-parity proxy (1/vol), and
+# Mean-variance (Σ^{-1}μ normalized). Results are evaluated using annualized mean,
+
+# 0) Inputs: factor excess return matrix (T x K)
+factor_cols <- c("MKT", "SMB", "HML", "RMW", "CMA", "MOM")
+stopifnot(all(factor_cols %in% names(factors)))
+
+R_excess <- factors %>%
+  arrange(date) %>%
+  select(all_of(factor_cols)) %>%
+  as.matrix()
+
+K <- ncol(R_excess)
+```
+
+### Equal-Weight Construction
+```{r}
+# 1) Equal-weight
+# simplest diversification rule; serves as a neutral benchmark for more complex portfolio construction.
+
+w_EW <- rep(1 / K, K)
+names(w_EW) <- colnames(R_excess)
+
+ret_EW <- as.vector(R_excess %*% w_EW)
+```
+
+### Risk-Parity Construction
+```{r}
+# 2) Risk-parity proxy (1/vol)
+# Allocate less to volatile factors and more to stable ones.
+# This is a simple approximation of equal risk contribution.
+
+sigma <- apply(R_excess, 2, sd, na.rm = TRUE)
+w_RP <- (1 / sigma) / sum(1 / sigma)
+names(w_RP) <- colnames(R_excess)
+
+ret_RP <- as.vector(R_excess %*% w_RP)
+```
+
+### Mean-Variance Construction
+```{r}
+# 3) Mean–variance (Σ^{-1}μ normalized)
+# Maximize Sharpe ratio under a full-investment constraint
+# (weights normalized to sum to 1). Uses sample mean/covariance estimates.
+
+mu <- colMeans(R_excess, na.rm = TRUE)
+Sigma <- cov(R_excess, use = "pairwise.complete.obs")
+
+w_MV <- as.vector(solve(Sigma, mu))
+w_MV <- w_MV / sum(w_MV)
+names(w_MV) <- colnames(R_excess)
+
+ret_MV <- as.vector(R_excess %*% w_MV)
+```
+
+```{r}
+# 4) Performance summary
+# Compare annualized mean, volatility, and Sharpe consistently
+# across allocation rules. (Uses ann_mean/ann_sd/ann_sharpe from utils.R.)
+
+perf_tbl <- tibble(
+  Strategy = c("Equal-weight", "Risk-parity (1/vol)", "Mean-variance"),
+  Return   = list(ret_EW, ret_RP, ret_MV)
+) %>%
+  mutate(
+    Ann_Mean = sapply(Return, ann_mean),
+    Ann_SD   = sapply(Return, ann_sd),
+    Sharpe   = sapply(Return, ann_sharpe)
+  ) %>%
+  select(-Return) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+knitr::kable(
+  perf_tbl,
+  caption = "Annualized performance: Equal-weight vs Risk-parity vs Mean-variance (factor excess portfolios)"
+)
+```
+
+## Portfolio Comparison: Market vs Multi-factor vs EW/RP/MV
+```{r}
+# Compare (i) Market total return, (ii) fixed-weight multi-factor total return,
+# and (iii) alternative factor-allocation rules (EW/RP/MV on factor excess returns).
+
+# --- Inputs / sanity checks ---
+stopifnot(all(c("date", "MKT_total", "mf_total") %in% names(factors)))
+stopifnot(exists("ret_EW"), exists("ret_RP"), exists("ret_MV"))
+
+# --- Annualized performance table (uses ann_* from utils.R) ---
+perf_all <- tibble(
+  Strategy = c("Market", "Multi-factor (fixed)", "Equal-weight", "Risk-parity (1/vol)", "Mean-variance"),
+  Return   = list(factors$MKT_total, factors$mf_total, ret_EW, ret_RP, ret_MV)
+) %>%
+  mutate(
+    Ann_Mean = sapply(Return, ann_mean),
+    Ann_SD   = sapply(Return, ann_sd),
+    Sharpe   = sapply(Return, ann_sharpe)
+  ) %>%
+  select(-Return) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+knitr::kable(
+  perf_all,
+  caption = "Annualized performance: Market vs fixed multi-factor vs EW/RP/MV factor portfolios"
+)
+
+# --- Cumulative return plot (compounded) ---
+cum_ports <- tibble(
+  date     = factors$date,
+  Market   = cumprod(1 + factors$MKT_total) - 1,
+  MF_fixed = cumprod(1 + factors$mf_total)  - 1,
+  EW       = cumprod(1 + ret_EW)            - 1,
+  RP       = cumprod(1 + ret_RP)            - 1,
+  MV       = cumprod(1 + ret_MV)            - 1
+) %>%
+  pivot_longer(-date, names_to = "Strategy", values_to = "CumReturn")
+
+p_cumret <- ggplot(cum_ports, aes(date, CumReturn, color = Strategy)) +
+  geom_hline(yintercept = 0, linewidth = 0.25, alpha = 0.6) +
+  geom_line(linewidth = 0.6) +
+  labs(
+    title = "Cumulative Returns: Market vs Multi-factor vs EW/RP/MV",
+    x = "Date",
+    y = "Cumulative return (growth of $1)"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_cumret
+```
+
+```{r}
+ggsave(file.path(DIR_RESULTS_FIGS, "ff5_factor_returns_timeseries.png"),
+       plot = p_ff5, width = 10, height = 5, dpi = 300)
+ggsave(file.path(DIR_RESULTS_FIGS, "cum_reutrn_market_vs_multifactor.png"),
+       plot = p_cum, width = 10, height = 5, dpi = 300)
+write.csv(perf_all,
+          file.path(DIR_RESULTS_TABLES, "portfolio_performance_summary.csv"),
+          row.names = FALSE)
+
+write.csv(contrib_tbl,
+          file.path(DIR_RESULTS_TABLES, "multifactor_contributions.csv"),
+          row.names = FALSE)
+write.csv(perf_all, file.path(DIR_RESULTS_TABLES, "portfolio_performance_all.csv"), row.names = FALSE)
+ggsave(file.path(DIR_RESULTS_FIGS, "cumulative_returns_all_strategies.png"),
+       plot = p_cumret, width = 10, height = 5, dpi = 300)
+saveRDS(cum_ports, file.path(DIR_DATA_PROCESSED, "cumulative_returns_all_strategies.rds"))
+```
